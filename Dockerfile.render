@@ -6,8 +6,10 @@ FROM base AS build
 WORKDIR /app
 COPY . .
 RUN pnpm install --no-frozen-lockfile
+RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/server build
+RUN test -f packages/plugins/sdk/dist/index.d.ts || (echo "ERROR: plugin-sdk build output missing" && exit 1)
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 
 FROM base AS production
@@ -17,7 +19,9 @@ COPY --from=build /app /app
 ENV NODE_ENV=production \
   HOST=0.0.0.0 \
   PORT=3100 \
-  SERVE_UI=true
+  SERVE_UI=true \
+  PAPERCLIP_MIGRATION_AUTO_APPLY=true \
+  HEARTBEAT_SCHEDULER_ENABLED=false
 
 EXPOSE 3100
 CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]

@@ -13,8 +13,6 @@ services:
     plan: starter
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    repo: https://github.com/paperclipai/paperclip
-    branch: master
     healthCheckPath: /api/health
     numInstances: 1
     envVars:
@@ -30,9 +28,7 @@ services:
         value: "3100"
       - key: SERVE_UI
         value: "true"
-      - key: PAPERCLIP_DEPLOYMENT_MODE
-        value: local_trusted
       - key: PAPERCLIP_MIGRATION_AUTO_APPLY
         value: "true"
       - key: HEARTBEAT_SCHEDULER_ENABLED
-        value: "true"
+        value: "false"
