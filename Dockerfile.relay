@@ -1,0 +1,22 @@
+FROM node:22-slim AS base
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+RUN corepack enable
+
+FROM base AS build
+WORKDIR /app
+COPY . .
+RUN pnpm install --no-frozen-lockfile
+RUN pnpm --filter @paperclipai/shared build
+RUN pnpm --filter @paperclipai/zo-relay build
+RUN test -f packages/zo-relay/dist/index.js || (echo "ERROR: relay build output missing" && exit 1)
+
+FROM base AS production
+WORKDIR /app
+COPY --from=build /app /app
+
+ENV NODE_ENV=production \
+  HOST=0.0.0.0 \
+  PORT=3200
+
+EXPOSE 3200
+CMD ["node", "packages/zo-relay/dist/index.js"]
