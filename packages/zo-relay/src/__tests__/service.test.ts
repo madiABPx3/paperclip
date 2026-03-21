@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { executeRelayRequest, deriveContinuityKey } from "../service.js";
 import type { ContinuityRecord, PaperclipWakePayload } from "../types.js";
+import { callEvalService } from "../eval-client.js";
 
 function basePayload(): PaperclipWakePayload {
   return {
@@ -108,6 +109,83 @@ describe("executeRelayRequest", () => {
     expect(updateIssueStatus).not.toHaveBeenCalled();
     expect(upserts[0]?.zoConversationId).toBe("conv_new");
   });
+
+  it("fails closed before Paperclip mutations when eval does not pass", async () => {
+    vi.mocked(callEvalService).mockResolvedValueOnce({
+      passed: false,
+      correlationId: "11111111-1111-1111-1111-111111111111",
+      results: [
+        {
+          metric_name: "safety",
+          score: 0.6,
+          threshold: 0.95,
+          passed: false,
+          metric_type: "g_eval",
+          reason: "Unsafe mutation",
+        },
+      ],
+    });
+
+    const payload = basePayload();
+    const postIssueComment = vi.fn(async () => ({}));
+    const updateIssueStatus = vi.fn(async () => ({}));
+
+    const result = await executeRelayRequest(payload, {
+      store: {
+        get: async () => null,
+        upsert: async () => undefined,
+      },
+      createPaperclipClient: () => ({
+        getAgent: async () => ({
+          id: payload.agentId,
+          companyId: "44444444-4444-4444-4444-444444444444",
+          name: "Ender",
+          role: "ceo",
+          capabilities: null,
+          metadata: { skills: ["architecture-governance"] },
+        }),
+        getIssueHeartbeatContext: async () => ({
+          issue: {
+            id: "22222222-2222-2222-2222-222222222222",
+            identifier: "ZOA-29",
+            title: "Example",
+            description: null,
+            status: "todo",
+            priority: "medium",
+            projectId: null,
+            goalId: null,
+            parentId: null,
+            assigneeAgentId: payload.agentId,
+            assigneeUserId: null,
+            updatedAt: new Date().toISOString(),
+          },
+          ancestors: [],
+          project: null,
+          goal: null,
+          commentCursor: null,
+          wakeComment: null,
+        }),
+        postIssueComment,
+        updateIssueStatus,
+      }),
+      resolvePersonaId: async () => "persona_ender",
+      resolveZoToken: () => "Bearer token",
+      now: () => new Date("2026-03-20T18:30:00.000Z"),
+      env: {
+        RELAY_EVAL_ENABLED: "true",
+        EVAL_SERVICE_URL: "https://eval.example.com/eval",
+        ZO_MODEL_SCENARIO_MAP_JSON: JSON.stringify({
+          general: { modelName: "byok:test-general", label: "test-general" },
+        }),
+      },
+      log: () => undefined,
+    });
+
+    expect(result.httpStatus).toBe(500);
+    expect(result.body.failureCode).toBe("eval_gate_failed");
+    expect(postIssueComment).not.toHaveBeenCalled();
+    expect(updateIssueStatus).not.toHaveBeenCalled();
+  });
 });
 
 vi.mock("../zo-client.js", () => ({
@@ -131,6 +209,19 @@ vi.mock("../zo-client.js", () => ({
     },
   })),
   ZoHttpError: class ZoHttpError extends Error {
+    constructor(message: string, readonly status: number) {
+      super(message);
+    }
+  },
+}));
+
+vi.mock("../eval-client.js", () => ({
+  callEvalService: vi.fn(async () => ({
+    passed: true,
+    correlationId: "11111111-1111-1111-1111-111111111111",
+    results: [],
+  })),
+  EvalHttpError: class EvalHttpError extends Error {
     constructor(message: string, readonly status: number) {
       super(message);
     }

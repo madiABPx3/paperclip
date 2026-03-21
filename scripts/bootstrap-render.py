@@ -346,9 +346,13 @@ def update_relay_env(state, agent_key_map):
         sys.exit(1)
 
     zo_token = os.environ.get("ZO_EXECUTION_TOKEN") or os.environ.get("ZO_CLIENT_IDENTITY_TOKEN")
+    eval_service_url = os.environ.get("EVAL_SERVICE_URL", "https://eval-service-abp.zocomputer.io/eval")
     updated = []
     saw_agent_map = False
     saw_zo_token = False
+    saw_eval_enabled = False
+    saw_eval_project = False
+    saw_eval_url = False
     changed = False
     for entry in env_vars:
         if entry.get("key") == "PAPERCLIP_AGENT_KEYS_JSON":
@@ -360,6 +364,18 @@ def update_relay_env(state, agent_key_map):
             updated.append({"key": "ZO_EXECUTION_TOKEN", "value": zo_token})
             saw_zo_token = True
             changed = changed or entry.get("value") != zo_token
+        elif entry.get("key") == "RELAY_EVAL_ENABLED":
+            updated.append({"key": "RELAY_EVAL_ENABLED", "value": "true"})
+            saw_eval_enabled = True
+            changed = changed or entry.get("value") != "true"
+        elif entry.get("key") == "RELAY_EVAL_PROJECT":
+            updated.append({"key": "RELAY_EVAL_PROJECT", "value": "paperclip"})
+            saw_eval_project = True
+            changed = changed or entry.get("value") != "paperclip"
+        elif entry.get("key") == "EVAL_SERVICE_URL":
+            updated.append({"key": "EVAL_SERVICE_URL", "value": eval_service_url})
+            saw_eval_url = True
+            changed = changed or entry.get("value") != eval_service_url
         else:
             updated.append(entry)
     if not saw_agent_map:
@@ -367,6 +383,15 @@ def update_relay_env(state, agent_key_map):
         changed = True
     if zo_token and not saw_zo_token:
         updated.append({"key": "ZO_EXECUTION_TOKEN", "value": zo_token})
+        changed = True
+    if not saw_eval_enabled:
+        updated.append({"key": "RELAY_EVAL_ENABLED", "value": "true"})
+        changed = True
+    if not saw_eval_project:
+        updated.append({"key": "RELAY_EVAL_PROJECT", "value": "paperclip"})
+        changed = True
+    if not saw_eval_url:
+        updated.append({"key": "EVAL_SERVICE_URL", "value": eval_service_url})
         changed = True
 
     if changed:

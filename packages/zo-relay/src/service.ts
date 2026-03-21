@@ -1,4 +1,5 @@
 import type { PaperclipAgentRecord, IssueHeartbeatContext } from "./paperclip-client.js";
+import { callEvalService, EvalHttpError, type RelayEvalResult } from "./eval-client.js";
 import { buildHeartbeatPrompt } from "./prompt.js";
 import { getScenarioModelConfig } from "./model-registry.js";
 import {
@@ -35,6 +36,19 @@ type ServiceDeps = {
   log(entry: Record<string, unknown>): void;
 };
 
+function shouldRunEval(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.RELAY_EVAL_ENABLED?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function getEvalServiceUrl(env: NodeJS.ProcessEnv): string {
+  const raw = env.EVAL_SERVICE_URL?.trim();
+  if (!raw) {
+    throw new Error("RELAY_EVAL_ENABLED is true but EVAL_SERVICE_URL is missing");
+  }
+  return raw;
+}
+
 function normalizeOptionalString(value: string): string | null {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
@@ -62,10 +76,38 @@ function isRetryableZoFailure(error: unknown): boolean {
   if (error instanceof ZoHttpError) {
     return error.status >= 500;
   }
+  if (error instanceof EvalHttpError) {
+    return error.status >= 500;
+  }
   if (error instanceof Error) {
     return error.name === "AbortError" || /fetch failed/i.test(error.message);
   }
   return false;
+}
+
+function formatEvalOutput(result: ZoStructuredOutput): string {
+  return JSON.stringify(
+    {
+      outcome: result.outcome,
+      summary_markdown: result.summary_markdown,
+      paperclip_actions: result.paperclip_actions,
+      continuity: result.continuity,
+    },
+    null,
+    2,
+  );
+}
+
+function summarizeEvalFailure(result: RelayEvalResult): string {
+  const failedMetrics = result.results
+    .filter((metric) => !metric.passed)
+    .map((metric) => `${metric.metric_name} (${metric.score.toFixed(2)} < ${metric.threshold.toFixed(2)})`);
+
+  if (failedMetrics.length > 0) {
+    return `Eval gate failed: ${failedMetrics.join(", ")}`;
+  }
+
+  return result.error?.trim() || "Eval gate failed";
 }
 
 async function applyPaperclipActions(input: {
@@ -142,6 +184,8 @@ export async function executeRelayRequest(
     agent,
     issueContext,
   });
+  const evalEnabled = shouldRunEval(deps.env);
+  const evalServiceUrl = evalEnabled ? getEvalServiceUrl(deps.env) : null;
   const personaId = await deps.resolvePersonaId(parsedPayload);
   const zoToken = deps.resolveZoToken();
   const model = getScenarioModelConfig(parsedPayload.relay.zoModelScenario, deps.env);
@@ -165,6 +209,37 @@ export async function executeRelayRequest(
 
       if (!result.conversationId) {
         throw new Error("Zo did not return a conversation_id");
+      }
+
+      let evalResult: RelayEvalResult | null = null;
+      if (evalEnabled && evalServiceUrl) {
+        evalResult = await callEvalService({
+          url: evalServiceUrl,
+          prompt,
+          output: formatEvalOutput(result.output),
+          correlationId: parsedPayload.runId,
+          project: deps.env.RELAY_EVAL_PROJECT?.trim() || "paperclip",
+          timeoutMs: Math.min(parsedPayload.relay.timeoutMs, 45000),
+        });
+
+        deps.log({
+          event: "relay.eval.complete",
+          runId: parsedPayload.runId,
+          agentId: parsedPayload.agentId,
+          continuityKey,
+          attempt: attempts,
+          passed: evalResult.passed,
+          metrics: evalResult.results.map((metric) => ({
+            metric: metric.metric_name,
+            score: metric.score,
+            threshold: metric.threshold,
+            passed: metric.passed,
+          })),
+        });
+
+        if (!evalResult.passed) {
+          throw new Error(summarizeEvalFailure(evalResult));
+        }
       }
 
       await applyPaperclipActions({
@@ -196,6 +271,7 @@ export async function executeRelayRequest(
         attempt: attempts,
         zoOutcome: result.output.outcome,
         modelName: model.modelName,
+        evalPassed: evalResult?.passed ?? null,
       });
 
       return {
@@ -230,6 +306,8 @@ export async function executeRelayRequest(
   }
 
   const retryable = isRetryableZoFailure(lastError);
+  const failureDetail = lastError instanceof Error ? lastError.message : String(lastError);
+  const evalFailure = !retryable && /eval gate failed/i.test(failureDetail);
   return {
     httpStatus: retryable ? 502 : 500,
     body: relayResult({
@@ -242,8 +320,8 @@ export async function executeRelayRequest(
       summaryMarkdown: "",
       paperclipActions: [],
       attemptCount: attempts,
-      failureCode: retryable ? "zo_retryable_failure" : "relay_terminal_failure",
-      failureDetail: lastError instanceof Error ? lastError.message : String(lastError),
+      failureCode: retryable ? "zo_retryable_failure" : evalFailure ? "eval_gate_failed" : "relay_terminal_failure",
+      failureDetail,
     }),
   };
 }

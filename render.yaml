@@ -83,6 +83,12 @@ services:
         sync: false
       - key: ZO_EXECUTION_TOKEN
         sync: false
+      - key: RELAY_EVAL_ENABLED
+        value: "true"
+      - key: RELAY_EVAL_PROJECT
+        value: "paperclip"
+      - key: EVAL_SERVICE_URL
+        value: "https://eval-service-abp.zocomputer.io/eval"
       - key: ZO_MODEL_SCENARIO_MAP_JSON
         sync: false
       - key: PAPERCLIP_AGENT_KEYS_JSON
