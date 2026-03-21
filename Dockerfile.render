@@ -21,7 +21,9 @@ ENV NODE_ENV=production \
   PORT=3100 \
   SERVE_UI=true \
   PAPERCLIP_MIGRATION_AUTO_APPLY=true \
-  HEARTBEAT_SCHEDULER_ENABLED=false
+  HEARTBEAT_SCHEDULER_ENABLED=false \
+  DURABLE_ENGINE=legacy \
+  INNGEST_APP_ID=paperclip
 
 EXPOSE 3100
 CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]

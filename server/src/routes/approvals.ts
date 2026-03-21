@@ -10,6 +10,14 @@ import {
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
 import {
+  buildApprovalResolvedPayload,
+  isInngestPilotEnabled,
+  logDurableEngineFallback,
+  publishApprovalResolvedEvent,
+  readApprovalWorkflowMetadata,
+  withApprovalWorkflowMetadata,
+} from "../services/durable-engine.js";
+import {
   approvalService,
   heartbeatService,
   issueApprovalService,
@@ -33,6 +41,57 @@ export function approvalRoutes(db: Db) {
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
+
+  async function publishApprovalResolutionIfDurablePilot(
+    approval: {
+      id: string;
+      companyId: string;
+      status: string;
+      payload: Record<string, unknown>;
+      decisionNote: string | null;
+      decidedAt: Date | null;
+      decidedByUserId: string | null;
+      requestedByAgentId: string | null;
+    },
+    issueIds: string[],
+  ) {
+    if (!isInngestPilotEnabled()) return false;
+    if (
+      approval.status !== "approved" &&
+      approval.status !== "rejected" &&
+      approval.status !== "revision_requested"
+    ) {
+      return false;
+    }
+    const resolvedStatus = approval.status;
+    const workflowMeta = readApprovalWorkflowMetadata(approval.payload);
+    if (!workflowMeta?.runId) return false;
+
+    const payload = buildApprovalResolvedPayload({
+      companyId: approval.companyId,
+      approvalId: approval.id,
+      runId: workflowMeta.runId,
+      status: resolvedStatus,
+      decisionNote: approval.decisionNote,
+      decidedAt: approval.decidedAt,
+      decidedByUserId: approval.decidedByUserId,
+      requestingAgentId: approval.requestedByAgentId,
+      issueIds,
+    });
+
+    try {
+      await publishApprovalResolvedEvent(payload);
+      return true;
+    } catch (err) {
+      logDurableEngineFallback({
+        surface: "approval",
+        runId: workflowMeta.runId,
+        approvalId: approval.id,
+        err,
+      });
+      return false;
+    }
+  }
 
   router.get("/companies/:companyId/approvals", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -72,9 +131,12 @@ export function approvalRoutes(db: Db) {
         : approvalInput.payload;
 
     const actor = getActorInfo(req);
+    const payloadWithWorkflowMetadata = withApprovalWorkflowMetadata(normalizedPayload, {
+      runId: actor.runId,
+    });
     const approval = await svc.create(companyId, {
       ...approvalInput,
-      payload: normalizedPayload,
+      payload: payloadWithWorkflowMetadata,
       requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
       requestedByAgentId:
         approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null),
@@ -147,6 +209,26 @@ export function approvalRoutes(db: Db) {
       });
 
       if (approval.requestedByAgentId) {
+        const resumedViaDurableEngine = await publishApprovalResolutionIfDurablePilot(
+          approval,
+          linkedIssueIds,
+        );
+        if (resumedViaDurableEngine) {
+          await logActivity(db, {
+            companyId: approval.companyId,
+            actorType: "user",
+            actorId: req.actor.userId ?? "board",
+            action: "approval.resume_event_emitted",
+            entityType: "approval",
+            entityId: approval.id,
+            details: {
+              requesterAgentId: approval.requestedByAgentId,
+              linkedIssueIds,
+            },
+          });
+          res.json(redactApprovalPayload(approval));
+          return;
+        }
         try {
           const wakeRun = await heartbeat.wakeup(approval.requestedByAgentId, {
             source: "automation",
@@ -223,6 +305,8 @@ export function approvalRoutes(db: Db) {
     );
 
     if (applied) {
+      const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
+      const linkedIssueIds = linkedIssues.map((issue) => issue.id);
       await logActivity(db, {
         companyId: approval.companyId,
         actorType: "user",
@@ -230,8 +314,10 @@ export function approvalRoutes(db: Db) {
         action: "approval.rejected",
         entityType: "approval",
         entityId: approval.id,
-        details: { type: approval.type },
+        details: { type: approval.type, linkedIssueIds },
       });
+
+      await publishApprovalResolutionIfDurablePilot(approval, linkedIssueIds);
     }
 
     res.json(redactApprovalPayload(approval));
@@ -258,6 +344,10 @@ export function approvalRoutes(db: Db) {
         entityId: approval.id,
         details: { type: approval.type },
       });
+
+      const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
+      const linkedIssueIds = linkedIssues.map((issue) => issue.id);
+      await publishApprovalResolutionIfDurablePilot(approval, linkedIssueIds);
 
       res.json(redactApprovalPayload(approval));
     },
@@ -286,8 +376,18 @@ export function approvalRoutes(db: Db) {
           )
         : req.body.payload
       : undefined;
-    const approval = await svc.resubmit(id, normalizedPayload);
     const actor = getActorInfo(req);
+    const approval = await svc.resubmit(
+      id,
+      normalizedPayload
+        ? withApprovalWorkflowMetadata(normalizedPayload, {
+            runId:
+              (typeof actor.runId === "string" ? actor.runId : null) ??
+              readApprovalWorkflowMetadata(existing.payload)?.runId ??
+              null,
+          })
+        : undefined,
+    );
     await logActivity(db, {
       companyId: approval.companyId,
       actorType: actor.actorType,

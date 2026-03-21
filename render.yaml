@@ -36,6 +36,14 @@ services:
         value: "true"
       - key: HEARTBEAT_SCHEDULER_ENABLED
         value: "false"
+      - key: DURABLE_ENGINE
+        value: legacy
+      - key: INNGEST_APP_ID
+        value: paperclip
+      - key: INNGEST_EVENT_KEY
+        sync: false
+      - key: INNGEST_SIGNING_KEY
+        sync: false
   - type: worker
     name: paperclip-heartbeat-worker
     runtime: docker
@@ -56,6 +64,12 @@ services:
         value: "true"
       - key: HEARTBEAT_SCHEDULER_INTERVAL_MS
         value: "30000"
+      - key: DURABLE_ENGINE
+        value: legacy
+      - key: INNGEST_APP_ID
+        value: paperclip
+      - key: INNGEST_EVENT_KEY
+        sync: false
   - type: web
     name: paperclip-zo-relay
     runtime: docker

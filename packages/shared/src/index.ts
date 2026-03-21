@@ -118,6 +118,20 @@ export {
   type PluginBridgeErrorCode,
 } from "./constants.js";
 
+export {
+  durableEngineSchema,
+  paperclipHeartbeatRequestedEventName,
+  paperclipApprovalResolvedEventName,
+  heartbeatRequestedEventDataSchema,
+  approvalResolvedEventDataSchema,
+  buildHeartbeatRequestedEventId,
+  buildApprovalResolvedEventId,
+  buildApprovalResumeKey,
+  type DurableEngine,
+  type HeartbeatRequestedEventData,
+  type ApprovalResolvedEventData,
+} from "./inngest.js";
+
 export type {
   Company,
   Agent,

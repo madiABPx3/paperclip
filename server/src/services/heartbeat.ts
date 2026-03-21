@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType } from "@paperclipai/shared";
 import {
@@ -27,6 +27,12 @@ import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import { summarizeHeartbeatRunResultJson } from "./heartbeat-run-summary.js";
+import {
+  attachHeartbeatDispatchMarker,
+  isInngestPilotEnabled,
+  logDurableEngineFallback,
+  publishHeartbeatRequestedEvent,
+} from "./durable-engine.js";
 import {
   buildWorkspaceReadyComment,
   ensureRuntimeServicesForRun,
@@ -125,6 +131,7 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  deferDispatch?: boolean;
 }
 
 type UsageTotals = {
@@ -1358,6 +1365,16 @@ export function heartbeatService(db: Db) {
   }
 
   async function resumeQueuedRuns() {
+    if (isInngestPilotEnabled()) {
+      await db
+        .update(heartbeatRuns)
+        .set({
+          externalRunId: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.status, "queued"));
+    }
+
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
@@ -1435,14 +1452,46 @@ export function heartbeatService(db: Db) {
       const runningCount = await countRunningRunsForAgent(agentId);
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
+      const queuedConditions = [
+        eq(heartbeatRuns.agentId, agentId),
+        eq(heartbeatRuns.status, "queued"),
+      ];
+      if (isInngestPilotEnabled()) {
+        queuedConditions.push(isNull(heartbeatRuns.externalRunId));
+      }
 
       const queuedRuns = await db
         .select()
         .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")))
+        .where(and(...queuedConditions))
         .orderBy(asc(heartbeatRuns.createdAt))
         .limit(availableSlots);
       if (queuedRuns.length === 0) return [];
+
+      if (isInngestPilotEnabled()) {
+        const dispatchedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+        for (const queuedRun of queuedRuns) {
+          try {
+            const marker = await publishHeartbeatRequestedEvent(
+              queuedRun,
+              parseObject(queuedRun.contextSnapshot),
+            );
+            await attachHeartbeatDispatchMarker(db, queuedRun.id, marker);
+            const refreshed = await getRun(queuedRun.id);
+            if (refreshed) dispatchedRuns.push(refreshed);
+          } catch (err) {
+            logDurableEngineFallback({ surface: "heartbeat", runId: queuedRun.id, err });
+            const claimed = await claimQueuedRun(queuedRun);
+            if (claimed) {
+              dispatchedRuns.push(claimed);
+              void executeRun(claimed.id).catch((executeErr) => {
+                logger.error({ err: executeErr, runId: claimed.id }, "fallback heartbeat execution failed");
+              });
+            }
+          }
+        }
+        return dispatchedRuns;
+      }
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of queuedRuns) {
@@ -2154,6 +2203,53 @@ export function heartbeatService(db: Db) {
         }
   }
 
+  async function executeDurableRun(runId: string) {
+    await executeRun(runId);
+    return getRun(runId);
+  }
+
+  async function continueAfterApproval(input: {
+    agentId: string;
+    sourceRunId: string;
+    approvalId: string;
+    approvalStatus: "approved" | "rejected" | "revision_requested";
+    issueIds: string[];
+    decisionNote: string | null;
+    decidedByUserId: string | null;
+  }) {
+    const resumedRun = await enqueueWakeup(input.agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "approval_resolved_durable",
+      payload: {
+        approvalId: input.approvalId,
+        approvalStatus: input.approvalStatus,
+        issueId: input.issueIds[0] ?? null,
+        issueIds: input.issueIds,
+        decisionNote: input.decisionNote,
+        decidedByUserId: input.decidedByUserId,
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "inngest-pilot",
+      contextSnapshot: {
+        source: "approval.resolved",
+        approvalId: input.approvalId,
+        approvalStatus: input.approvalStatus,
+        issueId: input.issueIds[0] ?? null,
+        issueIds: input.issueIds,
+        taskId: input.issueIds[0] ?? null,
+        wakeReason: "approval_resolved_durable",
+        durableParentRunId: input.sourceRunId,
+      },
+      deferDispatch: true,
+    });
+
+    if (!resumedRun) return null;
+
+    await executeRun(resumedRun.id);
+    return getRun(resumedRun.id);
+  }
+
   async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
     const promotedRun = await db.transaction(async (tx) => {
       await tx.execute(
@@ -2669,7 +2765,9 @@ export function heartbeatService(db: Db) {
         },
       });
 
-      await startNextQueuedRunForAgent(agent.id);
+      if (!opts.deferDispatch) {
+        await startNextQueuedRunForAgent(agent.id);
+      }
       return newRun;
     }
 
@@ -2779,7 +2877,9 @@ export function heartbeatService(db: Db) {
       },
     });
 
-    await startNextQueuedRunForAgent(agent.id);
+    if (!opts.deferDispatch) {
+      await startNextQueuedRunForAgent(agent.id);
+    }
 
     return newRun;
   }
@@ -3115,6 +3215,10 @@ export function heartbeatService(db: Db) {
       }),
 
     wakeup: enqueueWakeup,
+
+    executeDurableRun,
+
+    continueAfterApproval,
 
     reapOrphanedRuns,
 

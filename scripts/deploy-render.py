@@ -140,6 +140,36 @@ def fetch_persona_map(token):
     return mapping
 
 
+SENSITIVE_ENV_SUBSTRINGS = ("SECRET", "TOKEN", "PASSWORD", "KEY", "DATABASE_URL")
+
+
+def maybe_env_var(key):
+    value = os.environ.get(key)
+    if value:
+        return {"key": key, "value": value}
+    return None
+
+
+def sanitize_env_vars(env_vars):
+    sanitized = []
+    for env_var in env_vars:
+        key = env_var.get("key", "")
+        value = env_var.get("value")
+        if any(part in key for part in SENSITIVE_ENV_SUBSTRINGS) and value is not None:
+            sanitized.append({"key": key, "value": "[redacted]"})
+            continue
+        sanitized.append(env_var)
+    return sanitized
+
+
+def sanitize_service_state(service):
+    sanitized = dict(service)
+    env_vars = service.get("env_vars")
+    if isinstance(env_vars, list):
+        sanitized["env_vars"] = sanitize_env_vars(env_vars)
+    return sanitized
+
+
 def create_service(owner_id, name, service_type, dockerfile_path, env_vars, default_slug, port=None, health_check_path=None):
     service_details = {
         "runtime": "docker",
@@ -236,7 +266,13 @@ def main():
         {"key": "PAPERCLIP_DEPLOYMENT_EXPOSURE", "value": "private"},
         {"key": "PAPERCLIP_MIGRATION_AUTO_APPLY", "value": "true"},
         {"key": "HEARTBEAT_SCHEDULER_ENABLED", "value": "false"},
+        {"key": "DURABLE_ENGINE", "value": "legacy"},
+        {"key": "INNGEST_APP_ID", "value": "paperclip"},
     ]
+    for optional_env in ("INNGEST_EVENT_KEY", "INNGEST_SIGNING_KEY"):
+        env_var = maybe_env_var(optional_env)
+        if env_var:
+            paperclip_env_vars.append(env_var)
 
     if database_url:
         paperclip_env_vars.append({"key": "DATABASE_URL", "value": database_url})
@@ -257,7 +293,12 @@ def main():
         {"key": "PAPERCLIP_MIGRATION_AUTO_APPLY", "value": "true"},
         {"key": "HEARTBEAT_SCHEDULER_ENABLED", "value": "true"},
         {"key": "HEARTBEAT_SCHEDULER_INTERVAL_MS", "value": "30000"},
+        {"key": "DURABLE_ENGINE", "value": "legacy"},
+        {"key": "INNGEST_APP_ID", "value": "paperclip"},
     ]
+    env_var = maybe_env_var("INNGEST_EVENT_KEY")
+    if env_var:
+        worker_env_vars.append(env_var)
     if database_url:
         worker_env_vars.append({"key": "DATABASE_URL", "value": database_url})
 
@@ -337,14 +378,14 @@ def main():
         "database": {
             "id": db_id,
             "name": "paperclip-db",
-            "internal_url": internal_url,
-            "external_url": external_url,
+            "internal_url": "[redacted]" if internal_url else "",
+            "external_url": "[redacted]" if external_url else "",
         },
-        "service": paperclip_service,
-        "worker": worker_service,
-        "relay": relay_service,
-        "relay_secret": relay_secret,
-        "auth_secret": auth_secret,
+        "service": sanitize_service_state(paperclip_service),
+        "worker": sanitize_service_state(worker_service),
+        "relay": sanitize_service_state(relay_service),
+        "relay_secret": "[redacted]",
+        "auth_secret": "[redacted]",
         "zo_persona_map": persona_map,
         "zo_model_scenario_map": model_scenario_map,
         "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

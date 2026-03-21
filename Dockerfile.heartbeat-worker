@@ -19,6 +19,8 @@ COPY --from=build /app /app
 ENV NODE_ENV=production \
   PAPERCLIP_MIGRATION_AUTO_APPLY=true \
   HEARTBEAT_SCHEDULER_ENABLED=true \
-  HEARTBEAT_SCHEDULER_INTERVAL_MS=30000
+  HEARTBEAT_SCHEDULER_INTERVAL_MS=30000 \
+  DURABLE_ENGINE=legacy \
+  INNGEST_APP_ID=paperclip
 
 CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/heartbeat-worker.js"]

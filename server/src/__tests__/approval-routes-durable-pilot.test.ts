@@ -30,11 +30,12 @@ const mockSecretService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
+
 const mockDurableEngine = vi.hoisted(() => ({
-  isInngestPilotEnabled: vi.fn(() => false),
-  readApprovalWorkflowMetadata: vi.fn(() => null),
+  isInngestPilotEnabled: vi.fn(() => true),
+  readApprovalWorkflowMetadata: vi.fn(() => ({ runId: "run-1" })),
   withApprovalWorkflowMetadata: vi.fn((payload: Record<string, unknown>) => payload),
-  buildApprovalResolvedPayload: vi.fn(),
+  buildApprovalResolvedPayload: vi.fn((input: Record<string, unknown>) => input),
   publishApprovalResolvedEvent: vi.fn(),
   logDurableEngineFallback: vi.fn(),
 }));
@@ -67,54 +68,63 @@ function createApp() {
   return app;
 }
 
-describe("approval routes idempotent retries", () => {
+describe("approval routes durable pilot integration", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
     mockIssueApprovalService.listIssuesForApproval.mockResolvedValue([{ id: "issue-1" }]);
     mockLogActivity.mockResolvedValue(undefined);
   });
 
-  it("does not emit duplicate approval side effects when approve is already resolved", async () => {
+  it("emits approval resolved events instead of waking the requester when the pilot owns resume", async () => {
     mockApprovalService.approve.mockResolvedValue({
       approval: {
         id: "approval-1",
         companyId: "company-1",
         type: "hire_agent",
         status: "approved",
-        payload: {},
+        payload: { __paperclipWorkflow: { runId: "run-1" } },
+        decisionNote: "ship it",
+        decidedAt: new Date("2026-03-21T12:00:00.000Z"),
+        decidedByUserId: "user-1",
         requestedByAgentId: "agent-1",
       },
-      applied: false,
+      applied: true,
     });
+    mockDurableEngine.publishApprovalResolvedEvent.mockResolvedValue("evt-1");
 
     const res = await request(createApp())
       .post("/api/approvals/approval-1/approve")
       .send({});
 
     expect(res.status).toBe(200);
-    expect(mockIssueApprovalService.listIssuesForApproval).not.toHaveBeenCalled();
+    expect(mockDurableEngine.publishApprovalResolvedEvent).toHaveBeenCalledTimes(1);
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
-    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  it("does not emit duplicate rejection logs when reject is already resolved", async () => {
-    mockApprovalService.reject.mockResolvedValue({
+  it("falls back to the legacy wakeup path if durable event emission fails", async () => {
+    mockApprovalService.approve.mockResolvedValue({
       approval: {
         id: "approval-1",
         companyId: "company-1",
         type: "hire_agent",
-        status: "rejected",
-        payload: {},
+        status: "approved",
+        payload: { __paperclipWorkflow: { runId: "run-1" } },
+        decisionNote: null,
+        decidedAt: new Date("2026-03-21T12:00:00.000Z"),
+        decidedByUserId: "user-1",
+        requestedByAgentId: "agent-1",
       },
-      applied: false,
+      applied: true,
     });
+    mockDurableEngine.publishApprovalResolvedEvent.mockRejectedValue(new Error("network"));
+    mockHeartbeatService.wakeup.mockResolvedValue({ id: "wake-1" });
 
     const res = await request(createApp())
-      .post("/api/approvals/approval-1/reject")
+      .post("/api/approvals/approval-1/approve")
       .send({});
 
     expect(res.status).toBe(200);
-    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(mockDurableEngine.logDurableEngineFallback).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
   });
 });

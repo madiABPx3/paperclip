@@ -25,6 +25,7 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
+import { getDurableEngine } from "./services/durable-engine.js";
 import { heartbeatService, reconcilePersistedRuntimeServicesOnStartup } from "./services/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -335,7 +336,8 @@ export async function startServer(): Promise<StartedServer> {
         initdbFlags: ["--encoding=UTF8", "--locale=C"],
         onLog: appendEmbeddedPostgresLog,
         onError: appendEmbeddedPostgresLog,
-      });
+        ...( process.getuid?.() === 0 ? { createPostgresUser: true } : {}),
+      } as any);
   
       if (!clusterAlreadyInitialized) {
         try {
@@ -600,6 +602,39 @@ export async function startServer(): Promise<StartedServer> {
     server.listen(listenPort, config.host, () => {
       server.off("error", onError);
       logger.info(`Server listening on ${config.host}:${listenPort}`);
+      const durableEngine = getDurableEngine();
+      const renderExternalUrl = process.env.RENDER_EXTERNAL_URL?.trim();
+      const hasInngestSigningKey = Boolean(process.env.INNGEST_SIGNING_KEY?.trim());
+      if (durableEngine === "inngest-pilot" && renderExternalUrl && hasInngestSigningKey) {
+        const inngestSyncUrl = new URL("/api/inngest", renderExternalUrl);
+        setTimeout(() => {
+          void fetch(inngestSyncUrl, { method: "PUT" })
+            .then(async (response) => {
+              const body = await response.text();
+              if (!response.ok) {
+                logger.warn(
+                  {
+                    status: response.status,
+                    url: inngestSyncUrl.toString(),
+                    body,
+                  },
+                  "Inngest self-registration failed",
+                );
+                return;
+              }
+              logger.info(
+                {
+                  status: response.status,
+                  url: inngestSyncUrl.toString(),
+                },
+                "Inngest self-registration attempted",
+              );
+            })
+            .catch((err) => {
+              logger.warn({ err, url: inngestSyncUrl.toString() }, "Inngest self-registration failed");
+            });
+        }, 2000);
+      }
       if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {
         const openHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
         const url = `http://${openHost}:${listenPort}`;

@@ -21,6 +21,8 @@ seed-*.mjs
 server/check-*.mjs
 server/seed-*.mjs
 packages/db/seed-*.mjs
+scripts/.render-*.json
+scripts/__pycache__/
 
 # npm publish build artifacts
 cli/package.dev.json
