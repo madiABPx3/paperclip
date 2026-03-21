@@ -1,28 +1,41 @@
 #!/usr/bin/env python3.12
-"""Deploy Paperclip to Render via API. Agent-executable, zero-human.
+"""Deploy Paperclip and the Zo relay to Render via API. Agent-executable, zero-human.
 
 Usage: python3.12 scripts/deploy-render.py [--teardown-first]
 
 Creates:
-  1. Managed Postgres (starter plan)
-  2. Web Service from Dockerfile (starter plan, connected to GitHub repo)
-  3. Links DATABASE_URL from Postgres to Web Service
+  1. Managed Postgres
+  2. Paperclip web service from Dockerfile.render
+  3. Zo relay web service from Dockerfile.relay
+  4. Links shared DATABASE_URL and relay secrets/env
 
 Outputs a JSON state file at scripts/.render-state.json for teardown/status.
 """
 import json
+import secrets
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
+import importlib.util
 
 API = "https://api.render.com/v1"
 KEY = os.environ.get("RENDER_API_KEY")
 STATE_FILE = os.path.join(os.path.dirname(__file__), ".render-state.json")
-REPO = "https://github.com/paperclipai/paperclip"
-BRANCH = "master"
+REPO = os.environ.get("RENDER_DEPLOY_REPO", "https://github.com/paperclipai/paperclip")
+BRANCH = os.environ.get("RENDER_DEPLOY_BRANCH", "master")
 OWNER_ID = None  # will be resolved
+ZO_API = "https://api.zo.computer"
+
+_zo_models_spec = importlib.util.spec_from_file_location(
+    "zo_models",
+    "/home/workspace/lib/zo_models.py",
+)
+_zo_models = importlib.util.module_from_spec(_zo_models_spec)
+assert _zo_models_spec and _zo_models_spec.loader
+_zo_models_spec.loader.exec_module(_zo_models)
 
 def api(method, path, body=None):
     url = f"{API}{path}"
@@ -39,6 +52,18 @@ def api(method, path, body=None):
         body_text = e.read().decode() if e.fp else ""
         print(f"API error {e.code} {method} {path}: {body_text}", file=sys.stderr)
         sys.exit(1)
+
+
+def http_json(method, url, token, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", token)
+    req.add_header("Accept", "application/json")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read().decode()
+        return json.loads(raw) if raw else {}
 
 def get_owner_id():
     result = api("GET", "/owners?limit=1")
@@ -81,6 +106,72 @@ def wait_for_service(svc_id, max_wait=600):
     print("Service did not deploy in time.", file=sys.stderr)
     return False
 
+
+def get_zo_token():
+    token = os.environ.get("ZO_EXECUTION_TOKEN") or os.environ.get("ZO_CLIENT_IDENTITY_TOKEN")
+    if not token:
+        print("Set ZO_EXECUTION_TOKEN or ZO_CLIENT_IDENTITY_TOKEN before deploying the relay.", file=sys.stderr)
+        sys.exit(1)
+    return token
+
+
+def build_model_scenario_map():
+    scenarios = _zo_models.get_scenarios()
+    mapping = {}
+    for scenario in scenarios:
+        model_name, label = _zo_models.get_model_for_scenario(scenario)
+        mapping[scenario] = {
+            "modelName": model_name,
+            "label": label,
+        }
+    return mapping
+
+
+def fetch_persona_map(token):
+    payload = http_json("GET", f"{ZO_API}/personas/available", token)
+    personas = payload.get("personas", [])
+    mapping = {}
+    for persona in personas:
+        name = persona.get("name")
+        persona_id = persona.get("id")
+        if isinstance(name, str) and isinstance(persona_id, str):
+            mapping[name] = persona_id
+    return mapping
+
+
+def create_service(owner_id, name, dockerfile_path, health_check_path, env_vars, default_slug, port):
+    svc = api("POST", "/services", {
+        "name": name,
+        "ownerId": owner_id,
+        "type": "web_service",
+        "repo": REPO,
+        "branch": BRANCH,
+        "autoDeploy": "yes",
+        "envVars": env_vars,
+        "serviceDetails": {
+            "runtime": "docker",
+            "plan": "starter",
+            "envSpecificDetails": {
+                "dockerfilePath": dockerfile_path,
+                "dockerContext": ".",
+            },
+            "healthCheckPath": health_check_path,
+            "numInstances": 1,
+        },
+    })
+    svc_info = svc.get("service", svc)
+    svc_id = svc_info["id"]
+    svc_url = svc_info.get("serviceDetails", {}).get("url") or f"https://{svc_info.get('slug', default_slug)}.onrender.com"
+    print(f"{name} created: {svc_id}")
+    print(f"URL: {svc_url}")
+    return {
+        "id": svc_id,
+        "name": name,
+        "url": svc_url,
+        "port": port,
+        "env_vars": env_vars,
+    }
+
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
@@ -98,6 +189,11 @@ def main():
 
     owner_id = get_owner_id()
     print(f"Owner ID: {owner_id}")
+    zo_token = get_zo_token()
+    persona_map = fetch_persona_map(zo_token)
+    model_scenario_map = build_model_scenario_map()
+    relay_secret = secrets.token_urlsafe(32)
+    auth_secret = secrets.token_urlsafe(48)
 
     # 1. Create Postgres
     print("\n=== Creating Managed Postgres ===")
@@ -121,45 +217,63 @@ def main():
     database_url = internal_url or external_url
     print(f"Database URL available: {'yes' if database_url else 'no'}")
 
-    # 2. Create Web Service
-    print("\n=== Creating Web Service ===")
-    env_vars = [
+    # 2. Create Paperclip Web Service
+    print("\n=== Creating Paperclip Web Service ===")
+    paperclip_public_base_url = "https://paperclip-server.onrender.com"
+    paperclip_env_vars = [
         {"key": "NODE_ENV", "value": "production"},
         {"key": "HOST", "value": "0.0.0.0"},
         {"key": "PORT", "value": "3100"},
         {"key": "SERVE_UI", "value": "true"},
-        {"key": "PAPERCLIP_DEPLOYMENT_MODE", "value": "local_trusted"},
+        {"key": "BETTER_AUTH_SECRET", "value": auth_secret},
+        {"key": "PAPERCLIP_AUTH_PUBLIC_BASE_URL", "value": paperclip_public_base_url},
+        {"key": "PAPERCLIP_DEPLOYMENT_MODE", "value": "authenticated"},
+        {"key": "PAPERCLIP_DEPLOYMENT_EXPOSURE", "value": "private"},
         {"key": "PAPERCLIP_MIGRATION_AUTO_APPLY", "value": "true"},
-        {"key": "HEARTBEAT_SCHEDULER_ENABLED", "value": "true"},
+        {"key": "HEARTBEAT_SCHEDULER_ENABLED", "value": "false"},
     ]
 
     if database_url:
-        env_vars.append({"key": "DATABASE_URL", "value": database_url})
+        paperclip_env_vars.append({"key": "DATABASE_URL", "value": database_url})
 
-    svc = api("POST", "/services", {
-        "name": "paperclip-server",
-        "ownerId": owner_id,
-        "type": "web_service",
-        "plan": "starter",
-        "repo": REPO,
-        "branch": BRANCH,
-        "autoDeploy": "yes",
-        "serviceDetails": {
-            "runtime": "docker",
-            "dockerfilePath": "./Dockerfile",
-            "dockerContext": ".",
-            "healthCheckPath": "/api/health",
-            "numInstances": 1,
-            "envVars": env_vars,
-        },
-    })
-    svc_info = svc.get("service", svc)
-    svc_id = svc_info["id"]
-    svc_url = svc_info.get("serviceDetails", {}).get("url") or f"https://{svc_info.get('slug', 'paperclip-server')}.onrender.com"
-    print(f"Web Service created: {svc_id}")
-    print(f"URL: {svc_url}")
+    paperclip_service = create_service(
+        owner_id=owner_id,
+        name="paperclip-server",
+        dockerfile_path="./Dockerfile.render",
+        health_check_path="/api/health",
+        env_vars=paperclip_env_vars,
+        default_slug="paperclip-server",
+        port="3100",
+    )
 
-    # If we didn't have the DB URL yet, update the service env var
+    relay_env_vars = [
+        {"key": "NODE_ENV", "value": "production"},
+        {"key": "HOST", "value": "0.0.0.0"},
+        {"key": "PORT", "value": "3200"},
+        {"key": "ZO_EXECUTION_TOKEN", "value": zo_token},
+        {"key": "PAPERCLIP_RELAY_SECRET", "value": relay_secret},
+        {"key": "ZO_MODEL_SCENARIO_MAP_JSON", "value": json.dumps(model_scenario_map, separators=(",", ":"))},
+        {"key": "ZO_PERSONA_MAP_JSON", "value": json.dumps(persona_map, separators=(",", ":"))},
+        {"key": "PAPERCLIP_AGENT_KEYS_JSON", "value": "{}"},
+    ]
+    if database_url:
+        relay_env_vars.extend([
+            {"key": "DATABASE_URL", "value": database_url},
+            {"key": "RELAY_DATABASE_URL", "value": database_url},
+        ])
+
+    print("\n=== Creating Zo Relay Web Service ===")
+    relay_service = create_service(
+        owner_id=owner_id,
+        name="paperclip-zo-relay",
+        dockerfile_path="./Dockerfile.relay",
+        health_check_path="/health",
+        env_vars=relay_env_vars,
+        default_slug="paperclip-zo-relay",
+        port="3200",
+    )
+
+    # If we didn't have the DB URL yet, update both services
     if not database_url:
         print("Fetching database connection string...")
         db_detail = api("GET", f"/postgres/{db_id}")
@@ -167,11 +281,20 @@ def main():
         ci = db_d.get("connectionInfo", {})
         database_url = ci.get("internalConnectionString") or ci.get("externalConnectionString", "")
         if database_url:
-            api("PUT", f"/services/{svc_id}/env-vars", [
-                *env_vars,
+            paperclip_env_vars = [
+                *paperclip_env_vars,
                 {"key": "DATABASE_URL", "value": database_url},
-            ])
-            print("DATABASE_URL set on service")
+            ]
+            relay_env_vars = [
+                *relay_env_vars,
+                {"key": "DATABASE_URL", "value": database_url},
+                {"key": "RELAY_DATABASE_URL", "value": database_url},
+            ]
+            api("PUT", f"/services/{paperclip_service['id']}/env-vars", paperclip_env_vars)
+            api("PUT", f"/services/{relay_service['id']}/env-vars", relay_env_vars)
+            paperclip_service["env_vars"] = paperclip_env_vars
+            relay_service["env_vars"] = relay_env_vars
+            print("DATABASE_URL set on both services")
 
     # Save state
     state = {
@@ -182,26 +305,28 @@ def main():
             "internal_url": internal_url,
             "external_url": external_url,
         },
-        "service": {
-            "id": svc_id,
-            "name": "paperclip-server",
-            "url": svc_url,
-        },
+        "service": paperclip_service,
+        "relay": relay_service,
+        "relay_secret": relay_secret,
+        "auth_secret": auth_secret,
+        "zo_persona_map": persona_map,
+        "zo_model_scenario_map": model_scenario_map,
         "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     save_state(state)
 
-    # Wait for deploy
-    print("\n=== Waiting for initial deploy ===")
-    success = wait_for_service(svc_id)
+    # Wait for deploys
+    print("\n=== Waiting for initial deploys ===")
+    paperclip_ok = wait_for_service(paperclip_service["id"])
+    relay_ok = wait_for_service(relay_service["id"])
+    success = paperclip_ok and relay_ok
 
     if success:
-        print(f"\n✓ Paperclip deployed successfully!")
-        print(f"  Server: {svc_url}")
-        print(f"  API: {svc_url}/api/health")
-        print(f"  Dashboard: {svc_url}")
+        print("\n✓ Paperclip stack deployed successfully!")
+        print(f"  Paperclip: {paperclip_service['url']}")
+        print(f"  Relay: {relay_service['url']}")
     else:
-        print(f"\n⚠ Deploy may still be in progress. Check: {svc_url}")
+        print(f"\n⚠ Deploy may still be in progress. Check: {paperclip_service['url']} and {relay_service['url']}")
         print("  Run: python3.12 scripts/render-status.py")
 
     return 0 if success else 1

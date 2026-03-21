@@ -14,6 +14,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agentApiKeys,
   authUsers,
+  instanceUserRoles,
   invites,
   joinRequests
 } from "@paperclipai/db";
@@ -1507,6 +1508,46 @@ export function accessRoutes(
     }
 
     throw conflict("Board claim challenge is no longer available");
+  });
+
+  router.post("/bootstrap/claim-admin", async (req, res) => {
+    const presentedSecret = typeof req.header("x-bootstrap-secret") === "string"
+      ? req.header("x-bootstrap-secret")!.trim()
+      : "";
+    const configuredSecret = (process.env.BETTER_AUTH_SECRET ?? "").trim();
+    if (!presentedSecret || !configuredSecret) {
+      throw unauthorized("Bootstrap secret required");
+    }
+    const presentedBytes = Buffer.from(presentedSecret, "utf8");
+    const configuredBytes = Buffer.from(configuredSecret, "utf8");
+    if (
+      presentedBytes.length !== configuredBytes.length ||
+      !timingSafeEqual(presentedBytes, configuredBytes)
+    ) {
+      throw unauthorized("Invalid bootstrap secret");
+    }
+    if (
+      req.actor.type !== "board" ||
+      req.actor.source !== "session" ||
+      !req.actor.userId
+    ) {
+      throw unauthorized("Sign in before claiming bootstrap admin access");
+    }
+
+    const existingAdminCount = await db
+      .select({ id: instanceUserRoles.id })
+      .from(instanceUserRoles)
+      .where(eq(instanceUserRoles.role, "instance_admin"))
+      .then((rows) => rows.length);
+    if (existingAdminCount > 0) {
+      throw conflict("Instance already has an admin user");
+    }
+
+    await db.insert(instanceUserRoles).values({
+      userId: req.actor.userId,
+      role: "instance_admin",
+    });
+    res.status(201).json({ claimed: true, userId: req.actor.userId });
   });
 
   async function assertCompanyPermission(
