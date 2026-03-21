@@ -152,20 +152,29 @@ export function issueRoutes(db: Db, storage: StorageService) {
     return true;
   }
 
-  async function normalizeIssueIdentifier(rawId: string): Promise<string> {
+  const ISSUE_UUID_REGEX =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  async function normalizeIssueIdentifier(rawId: string): Promise<string | null> {
     if (/^[A-Z]+-\d+$/i.test(rawId)) {
       const issue = await svc.getByIdentifier(rawId);
-      if (issue) {
-        return issue.id;
-      }
+      return issue?.id ?? null;
     }
-    return rawId;
+    if (ISSUE_UUID_REGEX.test(rawId)) {
+      return rawId;
+    }
+    return null;
   }
 
   // Resolve issue identifiers (e.g. "PAP-39") to UUIDs for all /issues/:id routes
   router.param("id", async (req, res, next, rawId) => {
     try {
-      req.params.id = await normalizeIssueIdentifier(rawId);
+      const resolved = await normalizeIssueIdentifier(rawId);
+      if (resolved === null) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      req.params.id = resolved;
       next();
     } catch (err) {
       next(err);
@@ -175,7 +184,12 @@ export function issueRoutes(db: Db, storage: StorageService) {
   // Resolve issue identifiers (e.g. "PAP-39") to UUIDs for company-scoped attachment routes.
   router.param("issueId", async (req, res, next, rawId) => {
     try {
-      req.params.issueId = await normalizeIssueIdentifier(rawId);
+      const resolved = await normalizeIssueIdentifier(rawId);
+      if (resolved === null) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      req.params.issueId = resolved;
       next();
     } catch (err) {
       next(err);

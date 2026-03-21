@@ -139,7 +139,8 @@ async function ensureEmbeddedPostgresConnection(
     initdbFlags: ["--encoding=UTF8", "--locale=C"],
     onLog: () => {},
     onError: () => {},
-  });
+    ...( process.getuid?.() === 0 ? { createPostgresUser: true } : {}),
+  } as any);
 
   if (!existsSync(path.resolve(dataDir, "PG_VERSION"))) {
     try {

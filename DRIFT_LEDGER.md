@@ -1,0 +1,15 @@
+# Paperclip Render Drift Ledger
+
+**Date**: 2026-03-21 UTC
+**Scope**: Explicit runtime/code/docs drift identified during the Render isolation analysis pass
+
+| Artifact | Expected state | Observed state | Risk | Principle ID | Recommended fix |
+|---|---|---|---|---|---|
+| `paperclip/AGENTS.md` | Primary project memory should reflect the current isolated Render baseline | Still describes the older Zo company state with 29 issues and prior heartbeat history | Future agents can restart from obsolete operating state | CORE-08, WORK-09 | Rewrite status sections to separate historical Zo path from current Render path |
+| Root workspace `AGENTS.md` Paperclip status line | System index should point to the live current control-plane status | Still says “Operational (pending Render isolation)” without the newer Render evidence split | Ambiguous truth source at workspace root | CORE-08 | Refresh the Paperclip row after the Render next slice is proven |
+| Core Zo route `https://abp.zo.space/api/paperclip-heartbeat` | Legacy path should be clearly demoted or removed if Render is the current evaluation baseline | Route remains active and still assumes local Paperclip + local eval service | Operators can confuse the legacy core-Zo path with the isolated Render path | ARCH-08, WORK-10 | Label it explicitly as legacy/core-Zo or retire it after cutover |
+| Core Zo test route `https://abp.zo.space/api/paperclip-test-heartbeat` | Test surfaces should be clearly scoped to local test mode only | Route remains active and mirrors the legacy local-eval pattern | Legacy assumptions can leak into Render analysis | ARCH-08 | Keep only if local test mode is still required; otherwise remove or relabel |
+| Eval integration claim | If the isolated Render path claims quality-gated execution, eval must be in that path | Core Zo heartbeat routes dispatch eval; `packages/zo-relay` does not | Render path can bypass claimed quality enforcement | WORK-04, WORK-10 | Add eval dispatch to Render relay or downgrade the docs to “not yet on isolated path” |
+| Session/workspace continuity on Render | Repeated heartbeats should preserve stable task/session/workspace identity | Only proved run has `sessionIdBefore=null`, `sessionIdAfter=null`, and fallback path `/[]/.paperclip/...` | Session continuity may fail silently on the next real multi-run task | ARCH-08, WORK-09 | Run a controlled second-heartbeat proof and fix workspace path serialization if reproduced |
+| Governance capability claims | Approval and budget behavior should be proven before being called operational on Render | APIs and services exist, but no isolated approval or budget incident was exercised | Docs overclaim live governance confidence | GOV-07, WORK-09 | Execute one approval flow and one budget hard-stop flow on the isolated company |
+| Cross-agent verification claims | Builder→Architect review chain should be visible in isolated runtime evidence | Current isolated company has one Ender-only issue/run and no `in_review` cycle | Verification chain is configured, not proven | WORK-04 | Seed a two-agent review scenario and prove `in_review` → reviewer decision end-to-end |

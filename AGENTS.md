@@ -1,145 +1,83 @@
-# AGENTS.md
+# Paperclip
 
-Guidance for human and AI contributors working in this repository.
+Project memory for agents working in `paperclip/`.
 
-## 1. Purpose
+## What Paperclip Is
 
-Paperclip is a control plane for AI-agent companies.
-The current implementation target is V1 and is defined in `doc/SPEC-implementation.md`.
+Paperclip is the control plane for autonomous agent operations. It owns:
+- companies, agents, goals, and issues
+- heartbeat scheduling and run tracking
+- approvals, budgets, and policy enforcement
+- audit and operator visibility
 
-## 2. Read This First
+Zo remains an execution plane. Render is the current managed hosting surface under evaluation for the isolated Paperclip deployment.
 
-Before making changes, read in this order:
+## Current Baseline
 
-1. `doc/GOAL.md`
-2. `doc/PRODUCT.md`
-3. `doc/SPEC-implementation.md`
-4. `doc/DEVELOPING.md`
-5. `doc/DATABASE.md`
+- Branch in active use for Render work: `codex/render-relay-deploy`
+- Live Render services currently tracked by this repo:
+  - `paperclip-server`
+  - `paperclip-heartbeat-worker`
+  - `paperclip-zo-relay`
+- Durable execution pilot exists in repo behind `DURABLE_ENGINE=legacy|inngest-pilot`
+- Default safe mode is `legacy`
+- `inngest-pilot` is not considered live until real `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY` are present on the Render server/worker and the managed deploy is proven
 
-`doc/SPEC.md` is long-horizon product context.
-`doc/SPEC-implementation.md` is the concrete V1 build contract.
+## Read First
 
-## 3. Repo Map
+Read in this order when touching durable execution or Render rollout:
+1. `INNGEST_PILOT_SLICE_2026-03-21.md`
+2. `HANDOFF_DURABLE_EXECUTION_NEXT_SESSION_2026-03-21.md`
+3. `GAP_ANALYSIS.md`
+4. `DRIFT_LEDGER.md`
 
-- `server/`: Express REST API and orchestration services
-- `ui/`: React + Vite board UI
-- `packages/db/`: Drizzle schema, migrations, DB clients
-- `packages/shared/`: shared types, constants, validators, API path constants
-- `doc/`: operational and product docs
+Read these when working specific adjacent areas:
+- Issue identifier guard: `doc/fix-spec-uuid-validation.md`
+- Cross-agent review/governance: `doc/CROSS_AGENT_VERIFICATION.md`
+- HyperSkills follow-up: `doc/hyperskills-refactor-spec.md`
 
-## 4. Dev Setup (Auto DB)
+## Working Rules
 
-Use embedded PGlite in dev by leaving `DATABASE_URL` unset.
+- Use the isolated test path for behavior changes before claiming success:
+  - start test server: `/home/workspace/.bin/start-paperclip-test.sh`
+  - bootstrap: `python3.12 /home/workspace/.bin/bootstrap-paperclip-test.py`
+  - trigger: `/home/workspace/.bin/trigger-test-heartbeat.sh`
+- Do not claim Render rollout complete from repo state alone. Prove the managed deploy and health surface. `(CORE-06, WORK-09)`
+- Treat `scripts/.render-*.json` as sensitive local scratch. Do not rely on them as canonical state; prefer Render API truth. `(ARCH-08)`
+- Keep `DURABLE_ENGINE=legacy` as rollback shape. Flip modes with `python3.12 scripts/set-durable-engine.py ...`, not dashboard edits. `(CORE-03, CORE-09)`
+- When editing docs, distinguish clearly between:
+  - historical Zo-centric integration state
+  - current Render-isolated baseline
 
-```sh
-pnpm install
-pnpm dev
-```
+## Verification Expectations
 
-This starts:
+- Durable pilot changes:
+  - targeted tests for durable engine and approval resume
+  - local route smoke if touching `/api/inngest`
+  - Render deploy proof before calling anything live
+- Issue route changes:
+  - verify malformed ids fail closed without hitting Postgres
+- Bootstrap / embedded-postgres changes:
+  - verify the CLI surface accepts the option you add
+  - verify root execution does not break embedded Postgres startup
 
-- API: `http://localhost:3100`
-- UI: `http://localhost:3100` (served by API server in dev middleware mode)
+## Known Open Gaps
 
-Quick checks:
+- Render deploys for commit `cd1c5c8` were triggered manually and may still be building; check live deploy status before assuming the durable pilot code is active.
+- Full monorepo `pnpm typecheck` currently fails in unrelated CLI files with a Drizzle type split (`cli/src/commands/auth-bootstrap-ceo.ts`, `cli/src/commands/worktree.ts`). Do not attribute that to the durable pilot without fresh proof.
+- Approval flows, budget hard-stop behavior, and cross-agent verification are not yet fully proven on the isolated Render baseline.
 
-```sh
-curl http://localhost:3100/api/health
-curl http://localhost:3100/api/companies
-```
+## Useful Files
 
-Reset local dev DB:
-
-```sh
-rm -rf data/pglite
-pnpm dev
-```
-
-## 5. Core Engineering Rules
-
-1. Keep changes company-scoped.
-Every domain entity should be scoped to a company and company boundaries must be enforced in routes/services.
-
-2. Keep contracts synchronized.
-If you change schema/API behavior, update all impacted layers:
-- `packages/db` schema and exports
-- `packages/shared` types/constants/validators
-- `server` routes/services
-- `ui` API clients and pages
-
-3. Preserve control-plane invariants.
-- Single-assignee task model
-- Atomic issue checkout semantics
-- Approval gates for governed actions
-- Budget hard-stop auto-pause behavior
-- Activity logging for mutating actions
-
-4. Do not replace strategic docs wholesale unless asked.
-Prefer additive updates. Keep `doc/SPEC.md` and `doc/SPEC-implementation.md` aligned.
-
-5. Keep plan docs dated and centralized.
-New plan documents belong in `doc/plans/` and should use `YYYY-MM-DD-slug.md` filenames.
-
-## 6. Database Change Workflow
-
-When changing data model:
-
-1. Edit `packages/db/src/schema/*.ts`
-2. Ensure new tables are exported from `packages/db/src/schema/index.ts`
-3. Generate migration:
-
-```sh
-pnpm db:generate
-```
-
-4. Validate compile:
-
-```sh
-pnpm -r typecheck
-```
-
-Notes:
-- `packages/db/drizzle.config.ts` reads compiled schema from `dist/schema/*.js`
-- `pnpm db:generate` compiles `packages/db` first
-
-## 7. Verification Before Hand-off
-
-Run this full check before claiming done:
-
-```sh
-pnpm -r typecheck
-pnpm test:run
-pnpm build
-```
-
-If anything cannot be run, explicitly report what was not run and why.
-
-## 8. API and Auth Expectations
-
-- Base path: `/api`
-- Board access is treated as full-control operator context
-- Agent access uses bearer API keys (`agent_api_keys`), hashed at rest
-- Agent keys must not access other companies
-
-When adding endpoints:
-
-- apply company access checks
-- enforce actor permissions (board vs agent)
-- write activity log entries for mutations
-- return consistent HTTP errors (`400/401/403/404/409/422/500`)
-
-## 9. UI Expectations
-
-- Keep routes and nav aligned with available API surface
-- Use company selection context for company-scoped pages
-- Surface failures clearly; do not silently ignore API errors
-
-## 10. Definition of Done
-
-A change is done when all are true:
-
-1. Behavior matches `doc/SPEC-implementation.md`
-2. Typecheck, tests, and build pass
-3. Contracts are synced across db/shared/server/ui
-4. Docs updated when behavior or commands change
+- Durable pilot runtime:
+  - `server/src/services/durable-engine.ts`
+  - `server/src/routes/inngest.ts`
+  - `server/src/services/heartbeat.ts`
+  - `packages/shared/src/inngest.ts`
+- Rollout helpers:
+  - `scripts/deploy-render.py`
+  - `scripts/set-durable-engine.py`
+  - `scripts/render-status.py`
+- Adjacent bugfix:
+  - `server/src/routes/issues.ts`
+  - `server/src/__tests__/issue-routes-uuid-guard.test.ts`
