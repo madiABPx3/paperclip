@@ -1,13 +1,14 @@
 #!/usr/bin/env python3.12
-"""Deploy Paperclip and the Zo relay to Render via API. Agent-executable, zero-human.
+"""Deploy Paperclip, the heartbeat worker, and the Zo relay to Render via API. Agent-executable, zero-human.
 
 Usage: python3.12 scripts/deploy-render.py [--teardown-first]
 
 Creates:
   1. Managed Postgres
   2. Paperclip web service from Dockerfile.render
-  3. Zo relay web service from Dockerfile.relay
-  4. Links shared DATABASE_URL and relay secrets/env
+  3. Heartbeat worker from Dockerfile.heartbeat-worker
+  4. Zo relay web service from Dockerfile.relay
+  5. Links shared DATABASE_URL and relay secrets/env
 
 Outputs a JSON state file at scripts/.render-state.json for teardown/status.
 """
@@ -139,25 +140,28 @@ def fetch_persona_map(token):
     return mapping
 
 
-def create_service(owner_id, name, dockerfile_path, health_check_path, env_vars, default_slug, port):
+def create_service(owner_id, name, service_type, dockerfile_path, env_vars, default_slug, port=None, health_check_path=None):
+    service_details = {
+        "runtime": "docker",
+        "plan": "starter",
+        "envSpecificDetails": {
+            "dockerfilePath": dockerfile_path,
+            "dockerContext": ".",
+        },
+        "numInstances": 1,
+    }
+    if health_check_path:
+        service_details["healthCheckPath"] = health_check_path
+
     svc = api("POST", "/services", {
         "name": name,
         "ownerId": owner_id,
-        "type": "web_service",
+        "type": service_type,
         "repo": REPO,
         "branch": BRANCH,
         "autoDeploy": "yes",
         "envVars": env_vars,
-        "serviceDetails": {
-            "runtime": "docker",
-            "plan": "starter",
-            "envSpecificDetails": {
-                "dockerfilePath": dockerfile_path,
-                "dockerContext": ".",
-            },
-            "healthCheckPath": health_check_path,
-            "numInstances": 1,
-        },
+        "serviceDetails": service_details,
     })
     svc_info = svc.get("service", svc)
     svc_id = svc_info["id"]
@@ -169,6 +173,7 @@ def create_service(owner_id, name, dockerfile_path, health_check_path, env_vars,
         "name": name,
         "url": svc_url,
         "port": port,
+        "type": service_type,
         "env_vars": env_vars,
     }
 
@@ -239,11 +244,31 @@ def main():
     paperclip_service = create_service(
         owner_id=owner_id,
         name="paperclip-server",
+        service_type="web_service",
         dockerfile_path="./Dockerfile.render",
-        health_check_path="/api/health",
         env_vars=paperclip_env_vars,
         default_slug="paperclip-server",
         port="3100",
+        health_check_path="/api/health",
+    )
+
+    worker_env_vars = [
+        {"key": "NODE_ENV", "value": "production"},
+        {"key": "PAPERCLIP_MIGRATION_AUTO_APPLY", "value": "true"},
+        {"key": "HEARTBEAT_SCHEDULER_ENABLED", "value": "true"},
+        {"key": "HEARTBEAT_SCHEDULER_INTERVAL_MS", "value": "30000"},
+    ]
+    if database_url:
+        worker_env_vars.append({"key": "DATABASE_URL", "value": database_url})
+
+    print("\n=== Creating Heartbeat Worker ===")
+    worker_service = create_service(
+        owner_id=owner_id,
+        name="paperclip-heartbeat-worker",
+        service_type="worker",
+        dockerfile_path="./Dockerfile.heartbeat-worker",
+        env_vars=worker_env_vars,
+        default_slug="paperclip-heartbeat-worker",
     )
 
     relay_env_vars = [
@@ -266,11 +291,12 @@ def main():
     relay_service = create_service(
         owner_id=owner_id,
         name="paperclip-zo-relay",
+        service_type="web_service",
         dockerfile_path="./Dockerfile.relay",
-        health_check_path="/health",
         env_vars=relay_env_vars,
         default_slug="paperclip-zo-relay",
         port="3200",
+        health_check_path="/health",
     )
 
     # If we didn't have the DB URL yet, update both services
@@ -285,16 +311,22 @@ def main():
                 *paperclip_env_vars,
                 {"key": "DATABASE_URL", "value": database_url},
             ]
+            worker_env_vars = [
+                *worker_env_vars,
+                {"key": "DATABASE_URL", "value": database_url},
+            ]
             relay_env_vars = [
                 *relay_env_vars,
                 {"key": "DATABASE_URL", "value": database_url},
                 {"key": "RELAY_DATABASE_URL", "value": database_url},
             ]
             api("PUT", f"/services/{paperclip_service['id']}/env-vars", paperclip_env_vars)
+            api("PUT", f"/services/{worker_service['id']}/env-vars", worker_env_vars)
             api("PUT", f"/services/{relay_service['id']}/env-vars", relay_env_vars)
             paperclip_service["env_vars"] = paperclip_env_vars
+            worker_service["env_vars"] = worker_env_vars
             relay_service["env_vars"] = relay_env_vars
-            print("DATABASE_URL set on both services")
+            print("DATABASE_URL set on all services")
 
     # Save state
     state = {
@@ -306,6 +338,7 @@ def main():
             "external_url": external_url,
         },
         "service": paperclip_service,
+        "worker": worker_service,
         "relay": relay_service,
         "relay_secret": relay_secret,
         "auth_secret": auth_secret,
@@ -318,8 +351,9 @@ def main():
     # Wait for deploys
     print("\n=== Waiting for initial deploys ===")
     paperclip_ok = wait_for_service(paperclip_service["id"])
+    worker_ok = wait_for_service(worker_service["id"])
     relay_ok = wait_for_service(relay_service["id"])
-    success = paperclip_ok and relay_ok
+    success = paperclip_ok and worker_ok and relay_ok
 
     if success:
         print("\n✓ Paperclip stack deployed successfully!")

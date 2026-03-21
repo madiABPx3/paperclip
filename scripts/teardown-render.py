@@ -45,11 +45,23 @@ def main():
         state = json.load(f)
 
     svc_id = state.get("service", {}).get("id")
+    worker_id = state.get("worker", {}).get("id")
+    relay_id = state.get("relay", {}).get("id")
     db_id = state.get("database", {}).get("id")
+
+    if relay_id:
+        print(f"Deleting relay service {relay_id}...")
+        api("DELETE", f"/services/{relay_id}")
+        print("  Done")
 
     if svc_id:
         print(f"Deleting web service {svc_id}...")
         api("DELETE", f"/services/{svc_id}")
+        print("  Done")
+
+    if worker_id:
+        print(f"Deleting worker service {worker_id}...")
+        api("DELETE", f"/services/{worker_id}")
         print("  Done")
 
     if db_id:

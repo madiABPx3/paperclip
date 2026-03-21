@@ -47,14 +47,19 @@ def main():
         print(f"  Status: {db_info.get('status', 'unknown')}")
         print(f"  Plan: {db_info.get('plan', 'unknown')}")
 
-    svc_id = state.get("service", {}).get("id")
-    if svc_id:
+    for key in ("service", "worker", "relay"):
+        svc_state = state.get(key, {})
+        svc_id = svc_state.get("id")
+        if not svc_id:
+            continue
         svc = api("GET", f"/services/{svc_id}")
         svc_info = svc.get("service", svc)
         print(f"\nService: {svc_info.get('name', 'unknown')}")
         print(f"  ID: {svc_id}")
-        print(f"  URL: {state.get('service', {}).get('url', 'unknown')}")
-        print(f"  Status: {svc_info.get('suspended', 'unknown') and 'suspended' or 'active'}")
+        print(f"  URL: {svc_state.get('url', 'unknown')}")
+        suspended = svc_info.get("suspended", "unknown")
+        status = "active" if suspended == "not_suspended" else suspended
+        print(f"  Status: {status}")
 
         deploys = api("GET", f"/services/{svc_id}/deploys?limit=1")
         if isinstance(deploys, list) and deploys:

@@ -11,7 +11,7 @@ services:
     name: paperclip-server
     runtime: docker
     plan: starter
-    dockerfilePath: ./Dockerfile
+    dockerfilePath: ./Dockerfile.render
     dockerContext: .
     healthCheckPath: /api/health
     numInstances: 1
@@ -28,7 +28,62 @@ services:
         value: "3100"
       - key: SERVE_UI
         value: "true"
+      - key: PAPERCLIP_DEPLOYMENT_MODE
+        value: authenticated
+      - key: PAPERCLIP_DEPLOYMENT_EXPOSURE
+        value: private
       - key: PAPERCLIP_MIGRATION_AUTO_APPLY
         value: "true"
       - key: HEARTBEAT_SCHEDULER_ENABLED
         value: "false"
+  - type: worker
+    name: paperclip-heartbeat-worker
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile.heartbeat-worker
+    dockerContext: .
+    numInstances: 1
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: paperclip-db
+          property: connectionString
+      - key: NODE_ENV
+        value: production
+      - key: PAPERCLIP_MIGRATION_AUTO_APPLY
+        value: "true"
+      - key: HEARTBEAT_SCHEDULER_ENABLED
+        value: "true"
+      - key: HEARTBEAT_SCHEDULER_INTERVAL_MS
+        value: "30000"
+  - type: web
+    name: paperclip-zo-relay
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile.relay
+    dockerContext: .
+    healthCheckPath: /health
+    numInstances: 1
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: paperclip-db
+          property: connectionString
+      - key: RELAY_DATABASE_URL
+        fromDatabase:
+          name: paperclip-db
+          property: connectionString
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: "3200"
+      - key: PAPERCLIP_RELAY_SECRET
+        sync: false
+      - key: ZO_EXECUTION_TOKEN
+        sync: false
+      - key: ZO_MODEL_SCENARIO_MAP_JSON
+        sync: false
+      - key: PAPERCLIP_AGENT_KEYS_JSON
+        sync: false
