@@ -14,6 +14,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agentApiKeys,
   authUsers,
+  companies,
   instanceUserRoles,
   invites,
   joinRequests
@@ -1539,14 +1540,25 @@ export function accessRoutes(
       .from(instanceUserRoles)
       .where(eq(instanceUserRoles.role, "instance_admin"))
       .then((rows) => rows.length);
-    if (existingAdminCount > 0) {
-      throw conflict("Instance already has an admin user");
+    const companyCount = await db
+      .select({ id: companies.id })
+      .from(companies)
+      .then((rows) => rows.length);
+    if (companyCount > 0) {
+      throw conflict("Instance is already bootstrapped");
     }
 
-    await db.insert(instanceUserRoles).values({
-      userId: req.actor.userId,
-      role: "instance_admin",
-    });
+    const alreadyAdmin = await db
+      .select({ id: instanceUserRoles.id })
+      .from(instanceUserRoles)
+      .where(and(eq(instanceUserRoles.userId, req.actor.userId), eq(instanceUserRoles.role, "instance_admin")))
+      .then((rows) => rows[0] ?? null);
+    if (!alreadyAdmin) {
+      await db.insert(instanceUserRoles).values({
+        userId: req.actor.userId,
+        role: "instance_admin",
+      });
+    }
     res.status(201).json({ claimed: true, userId: req.actor.userId });
   });
 

@@ -141,6 +141,9 @@ def api(method, base_url, path, body=None, opener=None):
     req.add_header("Accept", "application/json")
     if body is not None:
         req.add_header("Content-Type", "application/json")
+    if method.upper() not in ("GET", "HEAD", "OPTIONS"):
+        req.add_header("Origin", base_url)
+        req.add_header("Referer", f"{base_url}/")
     try:
         if opener is None:
             resp = urllib.request.urlopen(req, timeout=30)
@@ -295,30 +298,25 @@ def sign_up_admin(render_url, opener, creds):
 
 
 def claim_bootstrap_admin(render_url, opener, bootstrap_secret):
-    status_code, payload = api(
-        "POST",
-        render_url,
-        "/api/bootstrap/claim-admin",
-        {},
-        opener=opener,
+    req = urllib.request.Request(
+        f"{render_url}/api/bootstrap/claim-admin",
+        data=b"{}",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Bootstrap-Secret": bootstrap_secret,
+            "Origin": render_url,
+            "Referer": f"{render_url}/",
+        },
     )
-    if status_code == 401:
-        req = urllib.request.Request(
-            f"{render_url}/api/bootstrap/claim-admin",
-            data=b"{}",
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "X-Bootstrap-Secret": bootstrap_secret,
-            },
-        )
+    try:
         with opener.open(req, timeout=30) as resp:
             return json.loads(resp.read().decode() or "{}")
-    if status_code >= 400:
-        print(f"Bootstrap admin claim failed ({status_code}): {payload}", file=sys.stderr)
+    except urllib.error.HTTPError as e:
+        payload = e.read().decode() if e.fp else ""
+        print(f"Bootstrap admin claim failed ({e.code}): {payload}", file=sys.stderr)
         sys.exit(1)
-    return payload
 
 
 def accept_bootstrap_invite(render_url, opener, token):
@@ -377,7 +375,7 @@ def main():
     if health.get("deploymentMode") != "authenticated":
         print(f"Expected authenticated deployment mode, got {health.get('deploymentMode')}.", file=sys.stderr)
         sys.exit(1)
-    if health.get("bootstrapStatus") != "bootstrap_pending":
+    if health.get("bootstrapStatus") not in ("bootstrap_pending", "ready"):
         print(
             f"Instance is not awaiting first-admin bootstrap (bootstrapStatus={health.get('bootstrapStatus')}).",
             file=sys.stderr,
