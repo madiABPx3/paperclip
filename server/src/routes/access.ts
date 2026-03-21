@@ -15,6 +15,7 @@ import {
   agentApiKeys,
   authUsers,
   companies,
+  companyMemberships,
   instanceUserRoles,
   invites,
   joinRequests
@@ -86,6 +87,73 @@ function tokenHashesMatch(left: string, right: string) {
     leftBytes.length === rightBytes.length &&
     timingSafeEqual(leftBytes, rightBytes)
   );
+}
+
+function assertBootstrapSecret(req: Request) {
+  const presentedSecret = typeof req.header("x-bootstrap-secret") === "string"
+    ? req.header("x-bootstrap-secret")!.trim()
+    : "";
+  const configuredSecret = (process.env.BETTER_AUTH_SECRET ?? "").trim();
+  if (!presentedSecret || !configuredSecret) {
+    throw unauthorized("Bootstrap secret required");
+  }
+  const presentedBytes = Buffer.from(presentedSecret, "utf8");
+  const configuredBytes = Buffer.from(configuredSecret, "utf8");
+  if (
+    presentedBytes.length !== configuredBytes.length ||
+    !timingSafeEqual(presentedBytes, configuredBytes)
+  ) {
+    throw unauthorized("Invalid bootstrap secret");
+  }
+}
+
+async function ensureRecoveryAdminAccess(db: Db, userId: string) {
+  const existingAdmin = await db
+    .select({ id: instanceUserRoles.id })
+    .from(instanceUserRoles)
+    .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
+    .then((rows) => rows[0] ?? null);
+  if (!existingAdmin) {
+    await db.insert(instanceUserRoles).values({
+      userId,
+      role: "instance_admin",
+    });
+  }
+
+  const allCompanies = await db
+    .select({ id: companies.id })
+    .from(companies);
+  for (const company of allCompanies) {
+    const existingMembership = await db
+      .select({ id: companyMemberships.id, status: companyMemberships.status })
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.companyId, company.id),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, userId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+
+    if (!existingMembership) {
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: userId,
+        status: "active",
+        membershipRole: "owner",
+      });
+      continue;
+    }
+
+    if (existingMembership.status !== "active") {
+      await db
+        .update(companyMemberships)
+        .set({ status: "active", membershipRole: "owner", updatedAt: new Date() })
+        .where(eq(companyMemberships.id, existingMembership.id));
+    }
+  }
 }
 
 function requestBaseUrl(req: Request) {
@@ -1512,21 +1580,7 @@ export function accessRoutes(
   });
 
   router.post("/bootstrap/claim-admin", async (req, res) => {
-    const presentedSecret = typeof req.header("x-bootstrap-secret") === "string"
-      ? req.header("x-bootstrap-secret")!.trim()
-      : "";
-    const configuredSecret = (process.env.BETTER_AUTH_SECRET ?? "").trim();
-    if (!presentedSecret || !configuredSecret) {
-      throw unauthorized("Bootstrap secret required");
-    }
-    const presentedBytes = Buffer.from(presentedSecret, "utf8");
-    const configuredBytes = Buffer.from(configuredSecret, "utf8");
-    if (
-      presentedBytes.length !== configuredBytes.length ||
-      !timingSafeEqual(presentedBytes, configuredBytes)
-    ) {
-      throw unauthorized("Invalid bootstrap secret");
-    }
+    assertBootstrapSecret(req);
     if (
       req.actor.type !== "board" ||
       req.actor.source !== "session" ||
@@ -1560,6 +1614,32 @@ export function accessRoutes(
       });
     }
     res.status(201).json({ claimed: true, userId: req.actor.userId });
+  });
+
+  router.post("/bootstrap/recover-admin", async (req, res) => {
+    assertBootstrapSecret(req);
+    if (
+      req.actor.type !== "board" ||
+      req.actor.source !== "session" ||
+      !req.actor.userId
+    ) {
+      throw unauthorized("Sign in before recovering bootstrap admin access");
+    }
+
+    const companyCount = await db
+      .select({ id: companies.id })
+      .from(companies)
+      .then((rows) => rows.length);
+    if (companyCount === 0) {
+      throw conflict("Instance is not bootstrapped yet");
+    }
+
+    await ensureRecoveryAdminAccess(db, req.actor.userId);
+    res.status(200).json({
+      recovered: true,
+      userId: req.actor.userId,
+      companyCount,
+    });
   });
 
   async function assertCompanyPermission(
