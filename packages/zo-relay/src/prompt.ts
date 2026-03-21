@@ -65,6 +65,6 @@ export function buildHeartbeatPrompt(input: {
     "- Use `comment_issue` for narrative updates.",
     "- Use `update_issue_status` only when the issue status should change now.",
     "- Use `no_op` only when no issue exists in scope.",
+    "- The structured output schema does not support nulls: use empty strings for `issue_id`, `body_markdown`, `next_status`, and `continuation_hint` when a field is not applicable.",
   ].join("\n");
 }
-

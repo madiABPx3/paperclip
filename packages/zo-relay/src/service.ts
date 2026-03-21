@@ -35,6 +35,11 @@ type ServiceDeps = {
   log(entry: Record<string, unknown>): void;
 };
 
+function normalizeOptionalString(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 export function deriveContinuityKey(payload: PaperclipWakePayload): string {
   const context = payload.context;
   const preference = payload.relay.taskIdentityPreference;
@@ -75,22 +80,25 @@ async function applyPaperclipActions(input: {
       : input.issueContext?.issue.id ?? null;
 
   for (const action of input.actions) {
-    const issueId = action.issue_id ?? defaultIssueId;
+    const issueId = normalizeOptionalString(action.issue_id) ?? defaultIssueId;
     if (action.type === "no_op") continue;
     if (!issueId) {
       throw new Error(`Relay action ${action.type} required an issue id`);
     }
     if (action.type === "comment_issue") {
-      if (!action.body_markdown?.trim()) {
+      const body = normalizeOptionalString(action.body_markdown);
+      if (!body) {
         throw new Error("comment_issue action missing body_markdown");
       }
-      await input.paperclip.postIssueComment(issueId, action.body_markdown);
+      await input.paperclip.postIssueComment(issueId, body);
       continue;
     }
-    if (!action.next_status) {
+    const nextStatus = normalizeOptionalString(action.next_status) as RelayAction["next_status"] | null;
+    const body = normalizeOptionalString(action.body_markdown);
+    if (!nextStatus) {
       throw new Error("update_issue_status action missing next_status");
     }
-    await input.paperclip.updateIssueStatus(issueId, action.next_status, action.body_markdown);
+    await input.paperclip.updateIssueStatus(issueId, nextStatus, body);
   }
 }
 
@@ -239,4 +247,3 @@ export async function executeRelayRequest(
     }),
   };
 }
-

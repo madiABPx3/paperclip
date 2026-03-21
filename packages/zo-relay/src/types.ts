@@ -48,9 +48,9 @@ export const paperclipWakePayloadSchema = z.object({
 
 export const relayActionSchema = z.object({
   type: z.enum(["comment_issue", "update_issue_status", "no_op"]),
-  issue_id: z.string().uuid().nullable(),
-  body_markdown: z.string().nullable(),
-  next_status: issueStatusSchema.nullable(),
+  issue_id: z.string(),
+  body_markdown: z.string(),
+  next_status: z.string(),
 });
 
 export const zoStructuredOutputSchema = z.object({
@@ -59,7 +59,7 @@ export const zoStructuredOutputSchema = z.object({
   paperclip_actions: z.array(relayActionSchema),
   continuity: z.object({
     should_continue: z.boolean(),
-    continuation_hint: z.string().nullable(),
+    continuation_hint: z.string(),
   }),
 });
 
@@ -100,7 +100,6 @@ export type ContinuityRecord = {
 
 export const zoAskOutputFormat = {
   type: "object",
-  additionalProperties: false,
   properties: {
     outcome: {
       type: "string",
@@ -111,17 +110,22 @@ export const zoAskOutputFormat = {
       type: "array",
       items: {
         type: "object",
-        additionalProperties: false,
         properties: {
           type: {
             type: "string",
             enum: ["comment_issue", "update_issue_status", "no_op"],
           },
-          issue_id: { type: ["string", "null"] },
-          body_markdown: { type: ["string", "null"] },
+          issue_id: {
+            type: "string",
+            description: "UUID of the issue to act on, or empty string when no issue applies.",
+          },
+          body_markdown: {
+            type: "string",
+            description: "Markdown comment body, or empty string when not needed.",
+          },
           next_status: {
-            type: ["string", "null"],
-            enum: ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled", null],
+            type: "string",
+            enum: ["", "backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"],
           },
         },
         required: ["type", "issue_id", "body_markdown", "next_status"],
@@ -129,10 +133,12 @@ export const zoAskOutputFormat = {
     },
     continuity: {
       type: "object",
-      additionalProperties: false,
       properties: {
         should_continue: { type: "boolean" },
-        continuation_hint: { type: ["string", "null"] },
+        continuation_hint: {
+          type: "string",
+          description: "Empty string when there is no continuation hint.",
+        },
       },
       required: ["should_continue", "continuation_hint"],
     },
@@ -143,4 +149,3 @@ export const zoAskOutputFormat = {
 export function sha256(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
-
