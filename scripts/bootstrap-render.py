@@ -16,11 +16,9 @@ Flow:
 """
 import json
 import os
-import re
 import secrets
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -30,26 +28,18 @@ from http.cookiejar import CookieJar
 RENDER_API = "https://api.render.com/v1"
 STATE_FILE = os.path.join(os.path.dirname(__file__), ".render-state.json")
 BOOTSTRAP_STATE_FILE = os.path.join(os.path.dirname(__file__), ".render-bootstrap.json")
-WEBHOOK_SECRET_PATH = "/home/workspace/config/.paperclip-webhook-secret"
-PAPERCLIP_DIR = "/home/workspace/paperclip"
 
 
 def parse_args():
     args = {
         "render_url": None,
-        "db_url": None,
         "admin_email": None,
         "admin_password": None,
         "admin_name": "Paperclip Render Admin",
-        "force": False,
     }
     for arg in sys.argv[1:]:
-        if arg == "--force":
-            args["force"] = True
-        elif arg.startswith("--render-url="):
+        if arg.startswith("--render-url="):
             args["render_url"] = arg.split("=", 1)[1].rstrip("/")
-        elif arg.startswith("--db-url="):
-            args["db_url"] = arg.split("=", 1)[1]
         elif arg.startswith("--admin-email="):
             args["admin_email"] = arg.split("=", 1)[1]
         elif arg.startswith("--admin-password="):
@@ -83,6 +73,14 @@ def write_bootstrap_state(payload):
 def render_api(method, path, body=None):
     key = os.environ.get("RENDER_API_KEY")
     if not key:
+        probe = subprocess.run(
+            ["zsh", "-lc", "printf %s \"$RENDER_API_KEY\""],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        key = probe.stdout.strip()
+    if not key:
         print("RENDER_API_KEY not set; required to resolve the Render Postgres connection string.", file=sys.stderr)
         sys.exit(1)
     data = json.dumps(body).encode() if body is not None else None
@@ -94,6 +92,10 @@ def render_api(method, path, body=None):
     with urllib.request.urlopen(req, timeout=60) as resp:
         raw = resp.read().decode()
         return json.loads(raw) if raw else {}
+
+
+def restart_render_service(service_id):
+    return render_api("POST", f"/services/{service_id}/restart", {})
 
 
 def get_render_url(state, explicit_url=None):
@@ -110,43 +112,6 @@ def get_relay_url(state):
         print("No relay URL found in state file. Run deploy-render.py first.", file=sys.stderr)
         sys.exit(1)
     return url.rstrip("/")
-
-
-def get_db_url(state, explicit_db_url=None):
-    if explicit_db_url:
-        return ensure_ssl_db_url(explicit_db_url)
-    db_state = state.get("database", {})
-    if db_state.get("external_url"):
-        return ensure_ssl_db_url(db_state["external_url"])
-    db_id = db_state.get("id")
-    if not db_id:
-        print("No Render Postgres ID found in state file.", file=sys.stderr)
-        sys.exit(1)
-    conn_info = render_api("GET", f"/postgres/{db_id}/connection-info")
-    external = conn_info.get("externalConnectionString", "")
-    if external:
-        return ensure_ssl_db_url(external)
-    print("Render API did not return an external Postgres connection string.", file=sys.stderr)
-    sys.exit(1)
-
-
-def ensure_ssl_db_url(db_url):
-    parsed = urllib.parse.urlparse(db_url)
-    if not parsed.scheme.startswith("postgres"):
-        return db_url
-    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    keys = {key for key, _ in query}
-    if "sslmode" not in keys:
-        query.append(("sslmode", "require"))
-    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query)))
-
-
-def get_webhook_secret():
-    try:
-        with open(WEBHOOK_SECRET_PATH) as f:
-            return f.read().strip()
-    except OSError:
-        return None
 
 
 def api(method, base_url, path, body=None, opener=None):
@@ -182,108 +147,6 @@ def ensure_service_ready(render_url):
         sys.exit(1)
     print(f"Server healthy: {health}")
     return health
-
-
-def write_remote_bootstrap_config(db_url, render_url):
-    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-    config = {
-        "$meta": {
-            "version": 1,
-            "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source": "configure",
-        },
-        "database": {
-            "mode": "postgres",
-            "connectionString": db_url,
-            "backup": {
-                "enabled": True,
-                "intervalMinutes": 60,
-                "retentionDays": 30,
-                "dir": "~/.paperclip/instances/default/data/backups",
-            },
-        },
-        "logging": {
-            "mode": "file",
-            "logDir": "~/.paperclip/instances/default/logs",
-        },
-        "server": {
-            "deploymentMode": "authenticated",
-            "exposure": "private",
-            "host": "0.0.0.0",
-            "port": 3100,
-            "allowedHostnames": [urllib.parse.urlparse(render_url).hostname],
-            "serveUi": True,
-        },
-        "auth": {
-            "baseUrlMode": "explicit",
-            "publicBaseUrl": render_url,
-            "disableSignUp": False,
-        },
-        "storage": {
-            "provider": "local_disk",
-            "localDisk": {
-                "baseDir": "~/.paperclip/instances/default/data/storage",
-            },
-            "s3": {
-                "bucket": "paperclip",
-                "region": "us-east-1",
-                "prefix": "",
-                "forcePathStyle": False,
-            },
-        },
-        "secrets": {
-            "provider": "local_encrypted",
-            "strictMode": False,
-            "localEncrypted": {
-                "keyFilePath": "~/.paperclip/instances/default/secrets/master.key",
-            },
-        },
-    }
-    json.dump(config, tmp)
-    tmp.write("\n")
-    tmp.close()
-    return tmp.name
-
-
-def run_bootstrap_invite(db_url, render_url, force=False):
-    config_path = write_remote_bootstrap_config(db_url, render_url)
-    cmd = [
-        "pnpm",
-        "paperclipai",
-        "auth",
-        "bootstrap-ceo",
-        "--config",
-        config_path,
-        "--db-url",
-        db_url,
-        "--base-url",
-        render_url,
-    ]
-    if force:
-        cmd.append("--force")
-    result = subprocess.run(
-        cmd,
-        cwd=PAPERCLIP_DIR,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
-    try:
-        os.unlink(config_path)
-    except OSError:
-        pass
-    if result.returncode != 0:
-        print(output, file=sys.stderr)
-        sys.exit(result.returncode)
-    match = re.search(r"Invite URL:\s+(https?://\S+)", output)
-    if not match:
-        print(output, file=sys.stderr)
-        print("Could not parse bootstrap invite URL from CLI output.", file=sys.stderr)
-        sys.exit(1)
-    invite_url = match.group(1)
-    token = invite_url.rstrip("/").rsplit("/", 1)[-1]
-    return invite_url, token, output
 
 
 def create_authenticated_opener():
@@ -380,20 +243,6 @@ def recover_bootstrap_admin(render_url, opener, bootstrap_secret):
         payload = e.read().decode() if e.fp else ""
         print(f"Bootstrap admin recovery failed ({e.code}): {payload}", file=sys.stderr)
         sys.exit(1)
-
-
-def accept_bootstrap_invite(render_url, opener, token):
-    status_code, payload = api(
-        "POST",
-        render_url,
-        f"/api/invites/{token}/accept",
-        {"requestType": "human"},
-        opener=opener,
-    )
-    if status_code != 202:
-        print(f"Bootstrap invite acceptance failed ({status_code}): {payload}", file=sys.stderr)
-        sys.exit(1)
-    return payload
 
 
 def authed_api(method, render_url, path, body, opener):
@@ -496,18 +345,33 @@ def update_relay_env(state, agent_key_map):
         print("Relay metadata missing from .render-state.json", file=sys.stderr)
         sys.exit(1)
 
+    zo_token = os.environ.get("ZO_EXECUTION_TOKEN") or os.environ.get("ZO_CLIENT_IDENTITY_TOKEN")
     updated = []
     saw_agent_map = False
+    saw_zo_token = False
+    changed = False
     for entry in env_vars:
         if entry.get("key") == "PAPERCLIP_AGENT_KEYS_JSON":
-            updated.append({"key": "PAPERCLIP_AGENT_KEYS_JSON", "value": json.dumps(agent_key_map, separators=(",", ":"))})
+            next_value = json.dumps(agent_key_map, separators=(",", ":"))
+            updated.append({"key": "PAPERCLIP_AGENT_KEYS_JSON", "value": next_value})
             saw_agent_map = True
+            changed = changed or entry.get("value") != next_value
+        elif entry.get("key") == "ZO_EXECUTION_TOKEN" and zo_token:
+            updated.append({"key": "ZO_EXECUTION_TOKEN", "value": zo_token})
+            saw_zo_token = True
+            changed = changed or entry.get("value") != zo_token
         else:
             updated.append(entry)
     if not saw_agent_map:
         updated.append({"key": "PAPERCLIP_AGENT_KEYS_JSON", "value": json.dumps(agent_key_map, separators=(",", ":"))})
+        changed = True
+    if zo_token and not saw_zo_token:
+        updated.append({"key": "ZO_EXECUTION_TOKEN", "value": zo_token})
+        changed = True
 
-    render_api("PUT", f"/services/{relay_id}/env-vars", updated)
+    if changed:
+        render_api("PUT", f"/services/{relay_id}/env-vars", updated)
+        restart_render_service(relay_id)
     state["relay"]["env_vars"] = updated
 
 
@@ -626,7 +490,7 @@ def main():
             print(f"    relay key created: {key['id']}")
         else:
             print("    relay key reused from bootstrap state")
-    persist_bootstrap_state(bootstrap_state, agent_ids=agent_ids, agent_keys=agent_keys)
+        persist_bootstrap_state(bootstrap_state, agent_ids=agent_ids, agent_keys=agent_keys)
 
     if "Architect" in agent_ids and "Ender" in agent_ids:
         authed_api(
@@ -667,13 +531,11 @@ def main():
         agent_id = agent_ids[name]
         persona_id = persona_by_name.get(name)
         adapter_config = {
-            "heartbeatEnabled": True,
-            "heartbeatIntervalSeconds": 14400,
-            "maxConcurrentHeartbeatRuns": 1,
-            "heartbeatAdapter": {
-                "type": "http",
+            "adapterType": "http",
+            "adapterConfig": {
                 "url": f"{relay_url}/execute",
                 "method": "POST",
+                "timeoutMs": 45000,
                 "headers": {
                     "X-Paperclip-Relay-Secret": relay_secret,
                 },
@@ -690,6 +552,14 @@ def main():
                         "maxAttempts": 2,
                         "taskIdentityPreference": ["issueId", "taskKey", "runId"],
                     },
+                },
+            },
+            "runtimeConfig": {
+                "heartbeat": {
+                    "enabled": True,
+                    "intervalSec": 14400,
+                    "wakeOnDemand": True,
+                    "maxConcurrentRuns": 1,
                 },
             },
         }
