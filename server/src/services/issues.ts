@@ -1756,7 +1756,7 @@ export function issueService(db: Db) {
             const violation = computeCloseGateViolation({
               fromStatus: existing.status,
               toStatus: issueData.status,
-              requireProofDocumentOnClose: true,
+              requireProofDocumentOnClose: companyRow.requireProofDocumentOnClose,
               attachedDocumentCount: documentRows.length,
             });
             if (violation) throw conflict(violation);
